@@ -1,10 +1,14 @@
 from abc import ABCMeta, abstractmethod
 from pathlib import Path
 from typing import Any, List, Dict, Tuple, Optional
+
+from apscheduler.triggers.cron import CronTrigger
 from transmission_rpc import Client
 from urllib.parse import urlparse
+from datetime import datetime, timedelta
 
 from app.chain import ChainBase
+from app.log import logger
 from app.core.config import settings
 from app.core.event import EventManager
 from app.db.plugindata_oper import PluginDataOper
@@ -40,21 +44,38 @@ class TrackerLimit(metaclass=ABCMeta):
     # 插件版本
     plugin_version = "0.0.1"
     # 插件作者
-    plugin_author = "jxxghp,InfinityPacer"
+    plugin_author = "jxxghp,Fone-1"
     # 作者主页
-    author_url = "https://github.com/InfinityPacer"
+    author_url = "https://github.com/Fone-1"
     # 插件配置项ID前缀
-    plugin_config_prefix = "brushflow_"
+    plugin_config_prefix = "trackerLimit_"
     # 加载顺序
     plugin_order = 21
     # 可使用的用户级别
     auth_level = 2
 
+    # 存储下载器配置
     downloader_client = {}
-    client_trackers = {}
+    #
     downloader_helper = None
-    sites_helper = None
+    # 是否启用
     enabled = False
+    # 存储tracker限速设置
+    trackers_limits = ""
+    # 是否通知
+    notify = False
+    # 是否立即运行一次
+    onlyonce = False
+    # 是否重新获取所有下载器的tracker
+    getTrackers = False
+    # 需要限速的下载器
+    limitdownloader = None
+    # 定时
+    cron = None
+    # 是否启用定时任务
+    task_enabled = False
+    # 默认12小时限速一次
+    _limit_interval = 720
 
     def __init__(self):
         # 插件数据
@@ -73,78 +94,125 @@ class TrackerLimit(metaclass=ABCMeta):
         生效配置信息
         :param config: 配置信息字典
         """
+        self.enabled = config.get("enabled", False)
+        self.notify = config.get("notify", True)
+        self.onlyonce = config.get("onlyonce", False)
         self.downloader_helper = DownloaderHelper()
-        self.enabled = config.get("enabled")
+        self.trackers_limits = config.get("trackers_limits", "")
+        self.getTrackers = config.get("getTrackers", False)
+        self.cron = config.get("cron")
+        self.limitdownloader = config.get("limitdownloader")
+        self.task_enabled = self.enabled and self.limitdownloader
+        # self.downloader_client = config.get("downloader_client", {})
 
-        for config in self.downloader_helper.get_configs().values():
-            if config.type == 'transmission':
-                host = urlparse(config.config['host'])
-                TRANSMISSION_HOST = host.hostname
-                TRANSMISSION_PORT = host.port
-                USERNAME = config.config['username']
-                PASSWORD = config.config['password']
-                isHttps = host.scheme == 'https'
-                if isHttps:
-                    client = Client(
-                        host=TRANSMISSION_HOST,
-                        port=TRANSMISSION_PORT,
-                        username=USERNAME,
-                        password=PASSWORD,
-                        protocol='https'
-                    )
-                else:
-                    client = Client(
-                        host=TRANSMISSION_HOST,
-                        port=TRANSMISSION_PORT,
-                        username=USERNAME,
-                        password=PASSWORD,
-                    )
-                self.downloader_client[config.name] = client
-                # 获取所有种子
-                torrents = client.get_torrents()
-                TrackerList = set()
-                for torrent in torrents:
-                    # 获取当前种子的Tracker列表
-                    tracker = torrent.trackers[0]
-
-                    # 分析所有Tracker的域名
-                    applicable_limits = []
-
+        if not self.downloader_client:
+            logger.info("未读取到下载器配置，开始连接下载器")
+            for config in self.downloader_helper.get_configs().values():
+                if config.type == 'transmission':
+                    host = urlparse(config.config['host'])
+                    TRANSMISSION_HOST = host.hostname
+                    TRANSMISSION_PORT = host.port
+                    USERNAME = config.config['username']
+                    PASSWORD = config.config['password']
+                    isHttps = host.scheme == 'https'
                     try:
-                        # 解析Tracker的域名
-                        url = tracker.announce
-                        hostname = urlparse(url).hostname
-                        TrackerList.add(hostname)
-                        # 查找匹配的限速规则
-                        # if hostname in TRACKER_SPEED_LIMITS:
-                        #     limit = TRACKER_SPEED_LIMITS[hostname]
-                        #     applicable_limits.append(limit)
+                        if isHttps:
+                            client = Client(
+                                host=TRANSMISSION_HOST,
+                                port=TRANSMISSION_PORT,
+                                username=USERNAME,
+                                password=PASSWORD,
+                                protocol='https'
+                            )
+                        else:
+                            client = Client(
+                                host=TRANSMISSION_HOST,
+                                port=TRANSMISSION_PORT,
+                                username=USERNAME,
+                                password=PASSWORD,
+                            )
                     except:
-                        continue
+                        logger.error(f"连接下载器{config.config['host']}失败！")
+                    self.downloader_client[config.name] = client
+                    if self.getTrackers:
+                        self.getTrackers = False
+                        self.update_config({"getTrackers": False, "trackers_limits": ""})
+                        # 获取所有种子
+                        torrents = client.get_torrents()
+                        for torrent in torrents:
+                            # 获取当前种子的Tracker列表
+                            tracker = torrent.trackers[0]
+                            # 解析Tracker的域名
+                            url = tracker.announce
+                            hostname = urlparse(url).hostname
+                            if self.trackers_limits.find(hostname) == -1:
+                                self.trackers_limits += hostname
+                                self.trackers_limits += ' -1'
+                                self.trackers_limits += '\n'
+                        print(self.trackers_limits)
+                        self.update_config({"trackers_limits": self.trackers_limits})
+                        pass
+                    else:
+                        pass
+        if self.onlyonce:
+            self.apply_limits()
+            self.onlyonce = False
+            self.update_config({"onlyonce": False, "trackers_limits": self.trackers_limits})
+        pass
 
-                    # # 确定最终的限速值（取最严格限制）
-                    # if applicable_limits:
-                    #     final_limit = min(applicable_limits)  # 使用最小值确保严格限速
-                    # else:
-                    #     final_limit = None  # 无限制
-                    #
-                    # # 转换为字节单位（Transmission API需要）
-                    # current_limit = torrent.download_limit
-                    # new_limit = final_limit * 1024 if final_limit is not None else 0
-                    #
-                    # # 仅当限速值变化时更新
-                    # if current_limit != new_limit:
-                    #     print(f'更新种子 [{torrent.name}] 限速: {final_limit}KB/s')
-                    #     client.change_torrent(
-                    #         torrent.id,
-                    #         download_limit=new_limit
-                    #     )
-                print(TrackerList)
-                self.client_trackers[config.name] = TrackerList
+    def apply_limits(self):
+        """
+        应用限速设置
+        """
+        limits = self.trackers_limits.split('\n')
+        speed = {}
+        cancelNum = 0
+        applyNum = 0
+        for limit in limits:
+            if limit is None or limit == '' or limit.find(' ') == -1:
                 pass
-            else:
+            temp = limit.split(' ')
+            if len(temp) == 2:
+                speed[temp[0]] = temp[1]
+        for key in self.downloader_client:
+            if key not in self.limitdownloader:
+                logger.info("下载器"+key+"不在限速下载器列表内，取消操作")
                 pass
-
+            downloader = self.downloader_client[key]
+            torrents = downloader.get_torrents()
+            for torrent in torrents:
+                # 获取当前种子的Tracker列表
+                hosts = []
+                for tracker in torrent.trackers:
+                    url = tracker.announce
+                    hostname = urlparse(url).hostname
+                    hosts.append(hostname)
+                limit_host = [item for item in hosts if item in speed.keys()]
+                if limit_host:
+                    current_limit = torrent.upload_limit
+                    new_limit = int(speed[str(limit_host[0])])
+                    if new_limit == -1:
+                        logger.info(f'取消种子 [{torrent.name}] 限速，改用全局限速')
+                        downloader.change_torrent(
+                            torrent.id,
+                            honors_session_limits=True,
+                            upload_limited=False
+                        )
+                        cancelNum += 1
+                        pass
+                    # 仅当限速值变化时更新
+                    elif current_limit != new_limit:
+                        logger.info(f'更新种子 [{torrent.name}] 限速: {new_limit}KB/s')
+                        downloader.change_torrent(
+                            torrent.id,
+                            upload_limit=new_limit,
+                            honors_session_limits=False,
+                            upload_limited=True
+                        )
+                        applyNum += 1
+        msg = f"{cancelNum}个种子取消限速，{applyNum}个种子限速成功"
+        if self.notify:
+            self.post_message(mtype=NotificationType.Plugin, title="批量Tracker限速", text=msg)
         pass
 
     def get_state(self) -> bool:
@@ -188,75 +256,181 @@ class TrackerLimit(metaclass=ABCMeta):
         downloader_options = [{"title": config.name, "value": config.name}
                               for config in self.downloader_helper.get_configs().values()]
 
-        headers = [
-            {'title': 'Tracker', 'key': 'tracker', 'sortable': True},
-            {'title': '限速(K/s)', 'key': 'limit', 'sortable': True},
-        ]
-
-        items = [
-            {
-                'tracker': tracker,
-                'limit': 0
-            } for tracker in self.client_trackers["transimission"]
-        ]
         return [
                    {
-                       'component': 'VCol',
-                       'props': {
-                           'cols': 12,
-                           'md': 4
-                       },
+                       'component': 'VForm',
                        'content': [
                            {
-                               'component': 'VSwitch',
-                               'props': {
-                                   'model': 'enabled',
-                                   'label': '启用插件',
-                               }
-                           }
-                       ]
-                   },
-                   {
-                       'component': 'VCol',
-                       'props': {
-                           "cols": 12,
-                           "md": 3
-                       },
-                       'content': [
-                           {
-                               'component': 'VSelect',
-                               'props': {
-                                   'model': 'downloader',
-                                   'label': '下载器',
-                                   'items': downloader_options
-                               }
-                           }
-                       ]
-                   },
-                   {
-                       'component': 'VDataTableVirtual',
-                       'props': {
-                           'class': 'text-sm',
-                           'headers': headers,
-                           'items': items,
-                           'height': '30rem',
-                           'density': 'compact',
-                           'fixed-header': True,
-                           'hide-no-data': True,
-                           'hover': True
-                       },
-                       'content': [
-                           {
-                               'component': 'Template',
-                               'props': {
-                                   'v-solt': 'item.limit="{item}"'
-                               },
+                               'component': 'VRow',
                                'content': [
                                    {
-                                       'component': 'VTextField',
+                                       'component': 'VCol',
                                        'props': {
-                                           'model': 'item.limit',
-                                       }
+                                           'cols': 12,
+                                           'md': 4
+                                       },
+                                       'content': [
+                                           {
+                                               'component': 'VSwitch',
+                                               'props': {
+                                                   'model': 'enabled',
+                                                   'label': '启用插件',
+                                               }
+                                           }
+                                       ]
+                                   },
+                                   {
+                                       'component': 'VCol',
+                                       'props': {
+                                           'cols': 12,
+                                           'md': 4
+                                       },
+                                       'content': [
+                                           {
+                                               'component': 'VSwitch',
+                                               'props': {
+                                                   'model': 'notify',
+                                                   'label': '发送通知',
+                                               }
+                                           }
+                                       ]
+                                   },
+                                   {
+                                       'component': 'VCol',
+                                       'props': {
+                                           'cols': 12,
+                                           'md': 4
+                                       },
+                                       'content': [
+                                           {
+                                               'component': 'VSwitch',
+                                               'props': {
+                                                   'model': 'onlyonce',
+                                                   'label': '立即运行一次',
+                                               }
+                                           }
+                                       ]
+                                   }
+                               ]
+                           },
+                           {
+                               'component': 'VRow',
+                               'content': [
+                                   {
+                                       'component': 'VCol',
+                                       'props': {
+                                           "cols": 12,
+                                           "md": 4
+                                       },
+                                       'content': [
+                                           {
+                                               'component': 'VSwitch',
+                                               'props': {
+                                                   'model': 'getTrackers',
+                                                   'label': '重新获取Tracker',
+                                               }
+                                           }
+                                       ]
+                                   },
+                                   {
+                                       'component': 'VCol',
+                                       'props': {
+                                           "cols": 12,
+                                           "md": 4
+                                       },
+                                       'content': [
+                                           {
+                                               'component': 'VSwitch',
+                                               'props': {
+                                                   'model': 'cancelLimit',
+                                                   'label': '取消限速',
+                                               }
+                                           }
+                                       ]
+                                   },
+                                   {
+                                       'component': 'VCol',
+                                       'props': {
+                                           "cols": 12,
+                                           "md": 4
+                                       },
+                                       'content': [
+                                           {
+                                               'component': 'VCronField',
+                                               'props': {
+                                                   'model': 'cron',
+                                                   'label': '执行周期',
+                                                   'placeholder': '如：0 0-1 * * FRI,SUN'
+                                               }
+                                           }
+                                       ]
+                                   },
+                               ]
+                           },
+                           {
+                               'component': 'VRow',
+                               'content': [
+                                   {
+                                       'component': 'VCol',
+                                       'props': {
+                                           'cols': 12
+                                       },
+                                       'content': [
+                                           {
+                                               'component': 'VSelect',
+                                               'props': {
+                                                   'multiple': True,
+                                                   'chips': True,
+                                                   'clearable': True,
+                                                   'model': 'limitdownloader',
+                                                   'label': '限速下载器',
+                                                   'items': downloader_options
+                                               }
+                                           }
+                                       ]
+                                   }
+                               ]
+                           },
+                           {
+                               'component': 'VRow',
+                               'content': [
+                                   {
+                                       'component': 'VCol',
+                                       'props': {
+                                           'cols': 12
+                                       },
+                                       'content': [
+                                           {
+                                               'component': 'VTextarea',
+                                               'props': {
+                                                   'model': 'trackers_limits',
+                                                   'label': 'tracker限速',
+                                                   'rows': 10,
+                                                   'placeholder': '每行一个配置，格式为：tracker limits'
+                                               }
+                                           }
+                                       ]
+                                   }
+                               ]
+                           },
+                           {
+                               'component': 'VRow',
+                               'content': [
+                                   {
+                                       'component': 'VCol',
+                                       'props': {
+                                           'cols': 12,
+                                       },
+                                       'content': [
+                                           {
+                                               'component': 'VAlert',
+                                               'props': {
+                                                   'type': 'info',
+                                                   'variant': 'tonal',
+                                                   'text': '限速格式为host limits，中间有空格！！！单位为kb！！(-1为不限速)'
+                                               }
+                                           }
+                                       ]
                                    }
                                ]
                            }
@@ -264,7 +438,10 @@ class TrackerLimit(metaclass=ABCMeta):
                    }
                ], {
                    "enabled": False,
-
+                   "trackers_limits": self.trackers_limits,
+                   "onlyonce": False,
+                   "getTrackers": False,
+                   "corn":self.cron
                }
 
     def get_page(self) -> List[dict]:
@@ -286,6 +463,28 @@ class TrackerLimit(metaclass=ABCMeta):
             "kwargs": {} # 定时器参数
         }]
         """
+        if self.task_enabled:
+            if self.cron:
+                values = self.cron.split()
+                values[0] = f"{datetime.now().minute % 10}/10"
+                cron = " ".join(values)
+                logger.info(f"下载器限速定时服务启动，执行周期 {cron}")
+                cron_trigger = CronTrigger.from_crontab(cron)
+                return [{
+                    "id": "BrushFlow",
+                    "name": "下载器限速服务",
+                    "trigger": cron_trigger,
+                    "func": self.apply_limits
+                }]
+            else:
+                logger.info(f"下载器限速定时服务启动，时间间隔 {self._limit_interval} 分钟")
+                return [{
+                    "id": "BrushFlow",
+                    "name": "下载器限速服务",
+                    "trigger": "interval",
+                    "func": self.apply_limits,
+                    "kwargs": {"minutes": self._limit_interval}
+                }]
         pass
 
     def get_dashboard(self, key: str, **kwargs) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], List[dict]]]:
